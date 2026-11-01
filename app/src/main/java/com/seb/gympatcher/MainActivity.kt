@@ -167,15 +167,6 @@ class MainActivity : AppCompatActivity() {
                     }
                     return@execute
                 }
-                // Check GymClass is installed
-                try { packageManager.getPackageInfo(GAME_PKG, 0) }
-                catch (e: PackageManager.NameNotFoundException) {
-                    ui {
-                        log("GymClass isn't installed.\n\nInstall it from the Meta store first.")
-                        btnStep1.isEnabled = true
-                    }
-                    return@execute
-                }
                 // Back up OBB
                 val bakDir = File("$OBB_BAK/$GAME_PKG")
                 bakDir.deleteRecursively()
