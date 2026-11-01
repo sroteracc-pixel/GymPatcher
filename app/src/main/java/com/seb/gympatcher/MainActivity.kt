@@ -1,7 +1,11 @@
 package com.seb.gympatcher
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -14,7 +18,6 @@ import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import java.io.*
 import java.util.concurrent.Executors
 
@@ -25,6 +28,7 @@ class MainActivity : AppCompatActivity() {
     private val OBB_BAK       = "/sdcard/GymPatcherBackup/obb"
     private val MOD_APK_ASSET = "GymClass-modded.apk"
     private val REQ_STORAGE   = 1001
+    private val ACTION_INSTALL_RESULT = "com.seb.gympatcher.INSTALL_RESULT"
 
     private val executor = Executors.newSingleThreadExecutor()
     private val main     = Handler(Looper.getMainLooper())
@@ -36,6 +40,29 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnUninstall  : Button
 
     private var pendingAction: (() -> Unit)? = null
+
+    // Receives the PackageInstaller result broadcast
+    private val installReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, -1)
+            val msg    = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: ""
+            when (status) {
+                PackageInstaller.STATUS_SUCCESS -> {
+                    log("Modded GymClass installed!\n\nTap Step 3 to restore your game data and open GymClass.")
+                    btnStep2.isEnabled = true
+                }
+                PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                    // Shouldn't happen without root, but handle it gracefully
+                    val confirmIntent = intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                    if (confirmIntent != null) startActivity(confirmIntent)
+                }
+                else -> {
+                    log("Install failed (code $status): $msg\n\nMake sure the original GymClass is uninstalled first (Step 1), then try Step 2 again.")
+                    btnStep2.isEnabled = true
+                }
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,7 +79,20 @@ class MainActivity : AppCompatActivity() {
         btnStep3.setOnClickListener     { checkStorage { doStep3() } }
         btnUninstall.setOnClickListener { checkStorage { doUninstall() } }
 
+        // Register broadcast receiver for install result
+        val filter = IntentFilter(ACTION_INSTALL_RESULT)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(installReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(installReceiver, filter)
+        }
+
         checkStorage { showReady() }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { unregisterReceiver(installReceiver) } catch (_: Exception) {}
     }
 
     // ── Storage permission ──────────────────────────────────────────────────
@@ -107,8 +147,7 @@ class MainActivity : AppCompatActivity() {
             "Ready!\n\n" +
             "How to mod GymClass:\n\n" +
             "  Step 1 — Saves your game data and removes GymClass\n" +
-            "  Step 2 — Installs the modded version\n" +
-            "            (tap Install on the popup that appears)\n" +
+            "  Step 2 — Installs the modded version automatically\n" +
             "  Step 3 — Restores your game data and opens GymClass\n\n" +
             "Tap STEP 1 to begin"
         )
@@ -159,28 +198,61 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ── STEP 2: Install modded APK via system installer ─────────────────────
+    // ── STEP 2: Silent install via PackageInstaller.Session ─────────────────
     private fun doStep2() {
         btnStep2.isEnabled = false
-        log("Extracting modded APK...")
-        val outFile = File(filesDir, MOD_APK_ASSET)
-        try {
-            assets.open(MOD_APK_ASSET).use { inp ->
-                outFile.outputStream().use { out -> inp.copyTo(out) }
+        log("Installing modded GymClass... please wait.")
+        executor.execute {
+            try {
+                // Extract APK from assets to internal storage
+                val apkFile = File(filesDir, MOD_APK_ASSET)
+                assets.open(MOD_APK_ASSET).use { inp ->
+                    apkFile.outputStream().use { out -> inp.copyTo(out) }
+                }
+
+                val installer = packageManager.packageInstaller
+                val params = PackageInstaller.SessionParams(
+                    PackageInstaller.SessionParams.MODE_FULL_INSTALL
+                )
+                params.setAppPackageName(GAME_PKG)
+
+                val sessionId = installer.createSession(params)
+                val session   = installer.openSession(sessionId)
+
+                // Write APK bytes into the session
+                apkFile.inputStream().use { apkIn ->
+                    session.openWrite("base.apk", 0, apkFile.length()).use { sessionOut ->
+                        apkIn.copyTo(sessionOut)
+                        session.fsync(sessionOut)
+                    }
+                }
+
+                // PendingIntent that broadcasts back to our receiver
+                val resultIntent = Intent(ACTION_INSTALL_RESULT).apply {
+                    setPackage(packageName)
+                }
+                val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_MUTABLE
+                else
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT
+
+                val pendingIntent = android.app.PendingIntent.getBroadcast(
+                    this@MainActivity, sessionId, resultIntent, flags
+                )
+
+                session.commit(pendingIntent.intentSender)
+                session.close()
+
+                // APK extracted; receiver will update UI on completion
+                ui { log("Installing... this may take 10–20 seconds.") }
+
+            } catch (e: Exception) {
+                ui {
+                    log("Install failed: ${e.message}\n\nMake sure GymClass is fully uninstalled (Step 1) and try again.")
+                    btnStep2.isEnabled = true
+                }
             }
-        } catch (e: Exception) {
-            log("Mod APK missing from app bundle. The app needs to be rebuilt.")
-            btnStep2.isEnabled = true
-            return
         }
-        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", outFile)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        startActivity(intent)
-        log("Installer popup appeared!\n\nTap INSTALL, wait for it to finish, then come back and tap Step 3.")
-        btnStep2.isEnabled = true
     }
 
     // ── STEP 3: Restore OBB + launch ────────────────────────────────────────
